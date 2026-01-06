@@ -40,6 +40,7 @@ logger = init_logger(__name__)
 CUSTOM_TYPE_PICKLE = 1
 CUSTOM_TYPE_CLOUDPICKLE = 2
 CUSTOM_TYPE_RAW_VIEW = 3
+CUSTOM_TYPE_CUDA_TENSOR = 4  # For GPU tensor via CUDA IPC
 
 # MultiModalField class serialization type map.
 # These need to list all possible field types and match them
@@ -222,9 +223,27 @@ class MsgpackEncoder:
 
     def _encode_tensor(
         self, obj: torch.Tensor
-    ) -> tuple[str, tuple[int, ...], int | memoryview]:
+    ) -> tuple[str, tuple[int, ...], Any]:
         assert self.aux_buffers is not None
-        # view the tensor as a contiguous 1D array of bytes
+        dtype = str(obj.dtype).removeprefix("torch.")
+        
+        # GPU tensor: use CUDA IPC for zero-copy sharing (same machine only)
+        if obj.is_cuda:
+            obj = obj.contiguous()
+            # Get CUDA IPC handle via storage sharing
+            storage = obj.storage()
+            # _share_cuda_() returns (device, handle, storage_size_bytes, 
+            #                         storage_offset_bytes, ref_counter, ...)
+            cuda_share_info = storage._share_cuda_()
+            data = msgpack.Ext(CUSTOM_TYPE_CUDA_TENSOR, b"")  # marker
+            return dtype, obj.shape, data, {
+                "cuda_share": cuda_share_info,
+                "storage_offset": obj.storage_offset(),
+                "stride": obj.stride(),
+                "device": obj.device.index,
+            }
+        
+        # CPU tensor: use original logic
         arr_data = tensor_data(obj)
         if obj.nbytes < self.size_threshold:
             # Smaller tensors are encoded inline, just like ndarrays.
@@ -233,7 +252,6 @@ class MsgpackEncoder:
             # Otherwise encode index of backing buffer to avoid copy.
             data = len(self.aux_buffers)
             self.aux_buffers.append(arr_data)
-        dtype = str(obj.dtype).removeprefix("torch.")
         return dtype, obj.shape, data
 
     def _encode_mm_items(self, items: MultiModalKwargsItems) -> dict[str, Any]:
@@ -354,6 +372,11 @@ class MsgpackDecoder:
         return arr.reshape(shape)
 
     def _decode_tensor(self, arr: Any) -> torch.Tensor:
+        # Check if this is a CUDA tensor (4 elements) or CPU tensor (3 elements)
+        if len(arr) == 4:
+            dtype, shape, data, cuda_info = arr
+            return self._decode_cuda_tensor(dtype, shape, cuda_info)
+        
         dtype, shape, data = arr
         is_aux = isinstance(data, int)
         buffer = self.aux_buffers[data] if is_aux else data
@@ -374,6 +397,40 @@ class MsgpackDecoder:
             arr = arr.pin_memory() if self.pin_tensors else arr.clone()
         # Convert back to proper shape & type
         return arr.view(torch_dtype).view(shape)
+    
+    def _decode_cuda_tensor(
+        self, dtype: str, shape: tuple, cuda_info: dict
+    ) -> torch.Tensor:
+        """Decode a CUDA tensor from IPC shared memory.
+        
+        Creates a copy to release the shared memory reference immediately,
+        preventing memory leaks in the sender process.
+        """
+        torch_dtype = getattr(torch, dtype)
+        assert isinstance(torch_dtype, torch.dtype)
+        
+        cuda_share = cuda_info["cuda_share"]
+        storage_offset = cuda_info["storage_offset"]
+        stride = tuple(cuda_info["stride"])
+        device_idx = cuda_info["device"]
+        
+        # Rebuild storage from CUDA IPC handle
+        # _share_cuda_() returns tuple that can be used with _new_shared_cuda_()
+        storage = torch.UntypedStorage._new_shared_cuda(*cuda_share)
+        
+        # Create tensor from storage
+        shared_tensor = torch.tensor([], dtype=torch_dtype, device=f"cuda:{device_idx}")
+        shared_tensor.set_(storage, storage_offset, shape, stride)
+        
+        # Clone the tensor to release the shared memory reference
+        # This allows the sender to free the original tensor
+        result = shared_tensor.clone()
+        
+        # Explicitly delete shared references to allow cleanup
+        del shared_tensor
+        del storage
+        
+        return result
 
     def _decode_mm_items(self, obj: dict[str, Any]) -> MultiModalKwargsItems:
         return MultiModalKwargsItems(
@@ -424,6 +481,10 @@ class MsgpackDecoder:
     def ext_hook(self, code: int, data: memoryview) -> Any:
         if code == CUSTOM_TYPE_RAW_VIEW:
             return data
+
+        if code == CUSTOM_TYPE_CUDA_TENSOR:
+            # CUDA tensor marker - actual data is in the tuple's 4th element
+            return None
 
         if envs.VLLM_ALLOW_INSECURE_SERIALIZATION:
             if code == CUSTOM_TYPE_PICKLE:

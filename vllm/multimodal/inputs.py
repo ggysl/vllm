@@ -511,11 +511,13 @@ class MultiModalBatchedField(BaseMultiModalField):
                 return batch[0].unsqueeze(0).contiguous()
             first_shape = batch[0].shape
             if all(elem.shape == first_shape for elem in batch):
+                # pin_memory only works for CPU tensors, disable it for CUDA
+                effective_pin_memory = pin_memory and not batch[0].is_cuda
                 out = torch.empty(
                     (len(batch), *batch[0].shape),
                     dtype=batch[0].dtype,
                     device=batch[0].device,
-                    pin_memory=pin_memory,
+                    pin_memory=effective_pin_memory,
                 )
                 return torch.stack(batch, out=out)
 
@@ -570,11 +572,13 @@ class MultiModalFlatField(BaseMultiModalField):
             if all(_shape_before_after(elem) == first_shape for elem in batch):
                 shape_before, shape_after = first_shape
                 shape_concat = sum(item.shape[dim] for item in batch)
+                # pin_memory only works for CPU tensors, disable it for CUDA
+                effective_pin_memory = pin_memory and not batch[0].is_cuda
                 out = torch.empty(
                     (*shape_before, shape_concat, *shape_after),
                     dtype=batch[0].dtype,
                     device=batch[0].device,
-                    pin_memory=pin_memory,
+                    pin_memory=effective_pin_memory,
                 )
                 return torch.concat(batch, dim=self.dim, out=out)
 

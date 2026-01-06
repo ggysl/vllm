@@ -143,6 +143,8 @@ def build_transform(input_size: int):
             T.Normalize(mean=MEAN, std=STD),
         ]
     )
+    mean_for_tensor = torch.tensor(IMAGENET_MEAN, device="cuda").view(1, 3, 1, 1)
+    std_for_tensor  = torch.tensor(IMAGENET_STD,  device="cuda").view(1, 3, 1, 1)
     # Image transformation operations (which include tensor computations
     # on the CPU) can occupy a substantial number of CPU cores, introducing
     # overhead due to CPU contention. This issue becomes particularly
@@ -153,6 +155,36 @@ def build_transform(input_size: int):
 
     def apply(img):
         with set_default_torch_num_threads(num_threads):
+            if isinstance(img, torch.Tensor) :
+                """
+                img: CUDA tensor, shape (1, H, W, 3)
+                """
+                assert img.is_cuda
+                assert img.ndim == 4 and img.shape[-1] == 3
+
+                # NHWC -> NCHW
+                img = img.permute(0, 3, 1, 2).contiguous()
+
+                # uint8 -> float32
+                if img.dtype == torch.uint8:
+                    img = img.float().div_(255.0)
+
+                # Resize（如果尺寸已经是 448 可直接跳过）
+                if img.shape[-1] != input_size or img.shape[-2] != input_size:
+                    img = torch.nn.functional.interpolate(
+                        img,
+                        size=(input_size, input_size),
+                        mode="bicubic",
+                        align_corners=False,
+                    )
+
+                # Normalize
+                img = (img - mean_for_tensor) / std_for_tensor
+
+                # 去掉 batch 维度
+                img = img.squeeze(0)   # (3, H, W)
+
+                return img
             return transform(img)
 
     return apply
@@ -251,6 +283,8 @@ def dynamic_preprocess_internvl(
     image_size: int,
     use_thumbnail: bool,
 ) -> list[Image.Image]:
+    if isinstance(image, torch.Tensor) :
+        return [image]
     orig_width, orig_height = image.size
 
     # calculate the number of blocks without thumbnail

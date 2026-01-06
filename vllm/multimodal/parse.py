@@ -333,10 +333,12 @@ class ImageProcessorItems(ProcessorBatchItems[HfImageItem]):
 
         if isinstance(image, PILImage.Image):
             return ImageSize(*image.size)
-        if isinstance(image, (np.ndarray, torch.Tensor)):
+        if isinstance(image, (np.ndarray)):
             _, h, w = image.shape
             return ImageSize(w, h)
-
+        if isinstance(image, torch.Tensor) :
+            _, h, w, _ = image.shape
+            return ImageSize(w, h)
         assert_never(image)
 
 
