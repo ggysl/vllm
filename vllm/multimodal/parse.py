@@ -334,10 +334,32 @@ class ImageProcessorItems(ProcessorBatchItems[HfImageItem]):
         if isinstance(image, PILImage.Image):
             return ImageSize(*image.size)
         if isinstance(image, (np.ndarray)):
-            _, h, w = image.shape
+            # Handle numpy arrays: (C, H, W) or (H, W, C)
+            if image.ndim == 3:
+                # Assume (C, H, W) format
+                _, h, w = image.shape
+            else:
+                raise ValueError(f"Unsupported numpy array shape: {image.shape}")
             return ImageSize(w, h)
-        if isinstance(image, torch.Tensor) :
-            _, h, w, _ = image.shape
+        if isinstance(image, torch.Tensor):
+            # Handle both 3D (single image) and 4D (batch) tensors
+            if image.dim() == 4:
+                # Batch of images: (B, H, W, C) in NHWC format
+                _, h, w, _ = image.shape
+            elif image.dim() == 3:
+                # Single image: could be (C, H, W) or (H, W, C)
+                # Check which dimension is 3 (channels) to determine format
+                if image.shape[0] == 3 or image.shape[0] == 1:
+                    # (C, H, W) format
+                    _, h, w = image.shape
+                elif image.shape[2] == 3 or image.shape[2] == 1:
+                    # (H, W, C) format
+                    h, w, _ = image.shape
+                else:
+                    # Ambiguous, assume (C, H, W)
+                    _, h, w = image.shape
+            else:
+                raise ValueError(f"Unsupported image tensor shape: {image.shape}")
             return ImageSize(w, h)
         assert_never(image)
 

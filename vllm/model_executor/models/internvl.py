@@ -159,6 +159,9 @@ def build_transform(input_size: int):
                 """
                 img: CUDA tensor, shape (1, H, W, 3)
                 """
+                if img.ndim == 3:
+                    img = img.unsqueeze(0)
+
                 assert img.is_cuda
                 assert img.ndim == 4 and img.shape[-1] == 3
 
