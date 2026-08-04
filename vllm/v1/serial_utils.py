@@ -42,6 +42,11 @@ CUSTOM_TYPE_PICKLE = 1
 CUSTOM_TYPE_CLOUDPICKLE = 2
 CUSTOM_TYPE_RAW_VIEW = 3
 
+# Key used inside the OOB-style ``data`` dict to carry a CUDA IPC handle so a
+# GPU tensor can be shared across processes with zero copy (no ``.cpu()``
+# fallback). It is read back by ``MsgpackDecoder._decode_tensor``.
+CUDA_IPC_KEY = "cuda_ipc"
+
 # MultiModalField class serialization type map.
 # These need to list all possible field types and match them
 # to factory methods in `MultiModalFieldConfig`.
@@ -131,6 +136,64 @@ class UtilityResult:
 
     def __init__(self, r: Any = None):
         self.result = r
+
+
+def _encode_cuda_ipc(obj: torch.Tensor) -> dict:
+    """Encode a CUDA tensor for zero-copy cross-process sharing via CUDA IPC.
+
+    The tensor is made contiguous and its storage is shared through a CUDA IPC
+    handle (``storage._share_cuda_()``). The returned dict is carried inline in
+    the serialized message (same slot as the OOB ``data`` dict) and is rebuilt
+    on the receiver side by :func:`_decode_cuda_ipc` without ever copying the
+    payload to the CPU.
+
+    Note: CUDA IPC only works between processes on the same machine with a
+    visible CUDA device, which matches the single-node deployment of vLLM.
+    """
+    obj = obj.contiguous()
+    storage = obj.storage()
+    # _share_cuda_() returns (device, handle, storage_size_bytes,
+    #                         storage_offset_bytes, ref_counter, ...)
+    cuda_share_info = storage._share_cuda_()
+    return {
+        CUDA_IPC_KEY: {
+            "cuda_share": cuda_share_info,
+            "storage_offset": obj.storage_offset(),
+            "stride": tuple(obj.stride()),
+            "device": obj.device.index,
+        }
+    }
+
+
+def _decode_cuda_ipc(dtype: str, shape: tuple, cuda_info: dict) -> torch.Tensor:
+    """Decode a CUDA tensor from a CUDA IPC handle (see ``_encode_cuda_ipc``).
+
+    Creates a copy to release the shared memory reference immediately,
+    preventing memory leaks in the sender process.
+    """
+    torch_dtype = getattr(torch, dtype)
+    assert isinstance(torch_dtype, torch.dtype)
+
+    cuda_share = cuda_info["cuda_share"]
+    storage_offset = cuda_info["storage_offset"]
+    stride = tuple(cuda_info["stride"])
+    device_idx = cuda_info["device"]
+
+    # Rebuild storage from the CUDA IPC handle.
+    storage = torch.UntypedStorage._new_shared_cuda(*cuda_share)
+
+    # Create tensor from storage.
+    shared_tensor = torch.tensor(
+        [], dtype=torch_dtype, device=f"cuda:{device_idx}"
+    )
+    shared_tensor.set_(storage, storage_offset, shape, stride)
+
+    # Clone to release the shared memory reference so the sender can free the
+    # original tensor.
+    result = shared_tensor.clone()
+    del shared_tensor
+    del storage
+    return result
 
 
 class MsgpackEncoder:
@@ -258,18 +321,23 @@ class MsgpackEncoder:
         self, obj: torch.Tensor
     ) -> tuple[str, tuple[int, ...], int | dict | memoryview]:
         oob_consumer = self.oob_tensor_consumer
+        dtype = str(obj.dtype).removeprefix("torch.")
         # view the tensor as a contiguous 1D array of bytes
         if obj.nbytes < self.size_threshold and obj.is_cpu:
             # Smaller tensors are encoded inline, just like ndarrays.
             data = msgpack.Ext(CUSTOM_TYPE_RAW_VIEW, tensor_data(obj))
         elif oob_consumer is not None and (data := oob_consumer(obj)) is not None:
             assert isinstance(data, dict)
+        elif obj.is_cuda:
+            # GPU tensor: share it via CUDA IPC so it is NEVER copied to the
+            # CPU (which would defeat the purpose of GPU-side preprocessing).
+            # Falls back only when an explicit OOB consumer rejected it above.
+            data = _encode_cuda_ipc(obj)
         else:
             # Otherwise encode index of backing buffer to avoid copy.
             assert self.aux_buffers is not None
             data = len(self.aux_buffers)
             self.aux_buffers.append(tensor_data(obj))
-        dtype = str(obj.dtype).removeprefix("torch.")
         return dtype, obj.shape, data
 
     def _encode_mm_items(self, items: MultiModalKwargsItems) -> dict[str, Any]:
@@ -399,6 +467,9 @@ class MsgpackDecoder:
     def _decode_tensor(self, arr: Any) -> torch.Tensor:
         dtype, shape, data = arr
         if isinstance(data, dict):
+            # CUDA IPC zero-copy tensor (no OOB provider required).
+            if CUDA_IPC_KEY in data:
+                return _decode_cuda_ipc(dtype, shape, data[CUDA_IPC_KEY])
             assert self.oob_tensor_provider, (
                 "Received OOB tensor but tensor provider is not set"
             )

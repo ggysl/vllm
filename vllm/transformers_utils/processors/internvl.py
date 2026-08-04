@@ -8,6 +8,8 @@
 # Licensed under The MIT License [see LICENSE for details]
 # --------------------------------------------------------
 
+import os
+
 import numpy.typing as npt
 import torch
 import torchvision.transforms as T
@@ -23,6 +25,7 @@ from transformers.processing_utils import ProcessorMixin
 from vllm.multimodal.image import convert_image_mode
 from vllm.multimodal.processing import PromptUpdateDetails
 from vllm.tokenizers.hf import HfTokenizer
+from vllm.utils.torch_utils import set_default_torch_num_threads
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -31,7 +34,7 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 # adapted from https://huggingface.co/OpenGVLab/InternVL2-1B
 def build_transform(input_size: int):
     MEAN, STD = IMAGENET_MEAN, IMAGENET_STD
-    return T.Compose(
+    transform = T.Compose(
         [
             T.Lambda(lambda img: convert_image_mode(img, "RGB")),
             T.Resize(
@@ -41,6 +44,59 @@ def build_transform(input_size: int):
             T.Normalize(mean=MEAN, std=STD),
         ]
     )
+    # Precomputed CUDA constants for the fast path that consumes GPU tensors
+    # directly, avoiding a CPU round-trip for normalization.
+    mean_for_tensor = torch.tensor(IMAGENET_MEAN, device="cuda").view(1, 3, 1, 1)
+    std_for_tensor = torch.tensor(IMAGENET_STD, device="cuda").view(1, 3, 1, 1)
+    # Image transformation operations (which include tensor computations
+    # on the CPU) can occupy a substantial number of CPU cores, introducing
+    # overhead due to CPU contention. This issue becomes particularly
+    # noticeable when deploying multiple vLLM instances on a single machine.
+    # Therefore, it is necessary to limit the number of threads allocated to
+    # image transformation tasks.
+    num_threads = int(os.environ.get("OMP_NUM_THREADS", "1"))
+
+    def apply(img):
+        with set_default_torch_num_threads(num_threads):
+            if isinstance(img, torch.Tensor):
+                """
+                img: CUDA tensor, shape (1, H, W, 3) in NHWC format.
+                A 3-D single-image tensor (H, W, 3) is also accepted and is
+                automatically promoted to a batch of one.
+                """
+                # Promote a 3-D single image (H, W, C) to (1, H, W, C).
+                if img.ndim == 3:
+                    img = img.unsqueeze(0)
+
+                assert img.is_cuda
+                assert img.ndim == 4 and img.shape[-1] == 3
+
+                # NHWC -> NCHW
+                img = img.permute(0, 3, 1, 2).contiguous()
+
+                # uint8 -> float32
+                if img.dtype == torch.uint8:
+                    img = img.float().div_(255.0)
+
+                # Resize (skip if the resolution already matches input_size)
+                if img.shape[-1] != input_size or img.shape[-2] != input_size:
+                    img = torch.nn.functional.interpolate(
+                        img,
+                        size=(input_size, input_size),
+                        mode="bicubic",
+                        align_corners=False,
+                    )
+
+                # Normalize
+                img = (img - mean_for_tensor) / std_for_tensor
+
+                # Drop the batch dimension
+                img = img.squeeze(0)   # (3, H, W)
+
+                return img
+            return transform(img)
+
+    return apply
 
 
 # adapted from https://huggingface.co/OpenGVLab/InternVL2-1B
@@ -136,6 +192,11 @@ def dynamic_preprocess_internvl(
     image_size: int,
     use_thumbnail: bool,
 ) -> list[Image.Image]:
+    # Fast path: when the caller supplies a pre-decoded GPU tensor, skip the
+    # PIL-based tiling/thumbnailing and return it unchanged so that the
+    # downstream transform can process it directly on the GPU.
+    if isinstance(image, torch.Tensor):
+        return [image]
     orig_width, orig_height = image.size
 
     # calculate the number of blocks without thumbnail

@@ -335,10 +335,17 @@ class ImageProcessorItems(ProcessorBatchItems[HfImageItem | None]):
         if isinstance(image, PILImage.Image):
             return ImageSize(*image.size)
         if isinstance(image, (np.ndarray, torch.Tensor)):
-            if image.ndim == 3 and image.shape[-1] in (1, 3, 4):
+            if image.ndim == 4 and image.shape[-1] in (1, 3, 4):
+                # NHWC batch format (e.g. a pre-decoded GPU tensor of shape
+                # (1, H, W, C)) used by the fast GPU preprocessing path.
+                _, h, w, _ = image.shape
+            elif image.ndim == 3 and image.shape[-1] in (1, 3, 4):
                 # HWC format (e.g. from np.array(PIL.Image)).
                 # PIL images are always channels-last.
                 h, w = image.shape[0], image.shape[1]
+            elif image.ndim == 3:
+                # Single image in CHW format.
+                _, h, w = image.shape
             else:
                 # CHW format (standard PyTorch / numpy convention).
                 _, h, w = image.shape
